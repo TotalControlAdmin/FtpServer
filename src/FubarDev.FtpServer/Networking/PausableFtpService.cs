@@ -71,23 +71,10 @@ namespace FubarDev.FtpServer.Networking
                 throw new InvalidOperationException($"Status must be {FtpServiceStatus.ReadyToRun}, but was {Status}.");
             }
 
-            using var semaphore = new SemaphoreSlimExt(0, 1);
             _jobPaused = new CancellationTokenSource();
-            _task = RunAsync(
-                new Progress<FtpServiceStatus>(
-                    status =>
-                    {
-                        Status = status;
 
-                        if (status == FtpServiceStatus.Running && !semaphore.IsDisposed)
-                        {
-                            // ReSharper disable once AccessToDisposedClosure
-                            semaphore?.Release();
-                        }
-                    }));
-
-            var res = semaphore.WaitAsync(cancellationToken);
-            res.Wait(cancellationToken);
+            await RunUntilRunningAsync(cancellationToken)
+               .ConfigureAwait(false);
         }
 
         /// <inheritdoc />
@@ -173,19 +160,7 @@ namespace FubarDev.FtpServer.Networking
             await OnContinueRequestingAsync(cancellationToken)
                .ConfigureAwait(false);
 
-            using var semaphore = new SemaphoreSlim(0, 1);
-            _task = RunAsync(new Progress<FtpServiceStatus>(status =>
-            {
-                Status = status;
-
-                if (status == FtpServiceStatus.Running)
-                {
-                    // ReSharper disable once AccessToDisposedClosure
-                    semaphore.Release();
-                }
-            }));
-
-            await semaphore.WaitAsync(cancellationToken)
+            await RunUntilRunningAsync(cancellationToken)
                .ConfigureAwait(false);
 
             await OnContinuedAsync(cancellationToken)
@@ -259,6 +234,29 @@ namespace FubarDev.FtpServer.Networking
             return Task.FromResult(false);
         }
 
+        private async Task RunUntilRunningAsync(CancellationToken cancellationToken)
+        {
+            // A TCS, not a disposable semaphore: a status report arriving after a cancelled wait cannot throw.
+            var running = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _task = RunAsync(
+                new SynchronousProgress(
+                    status =>
+                    {
+                        Status = status;
+
+                        if (status == FtpServiceStatus.Running)
+                        {
+                            running.TrySetResult(null);
+                        }
+                    }));
+
+            using (cancellationToken.Register(() => running.TrySetCanceled(cancellationToken)))
+            {
+                await running.Task
+                   .ConfigureAwait(false);
+            }
+        }
+
         private async Task RunAsync(
             IProgress<FtpServiceStatus> statusProgress)
         {
@@ -310,6 +308,18 @@ namespace FubarDev.FtpServer.Networking
             statusProgress.Report(FtpServiceStatus.Stopped);
             await OnStoppedAsync(CancellationToken.None)
                .ConfigureAwait(false);
+        }
+
+        private sealed class SynchronousProgress : IProgress<FtpServiceStatus>
+        {
+            private readonly Action<FtpServiceStatus> _handler;
+
+            public SynchronousProgress(Action<FtpServiceStatus> handler)
+            {
+                _handler = handler;
+            }
+
+            public void Report(FtpServiceStatus value) => _handler(value);
         }
     }
 }
